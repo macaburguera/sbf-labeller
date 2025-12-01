@@ -10,8 +10,11 @@ It is *not* a general package. It is just a helper I use together with my GNSS j
 The idea is simple:
 
 1. I preprocess the raw SBF logs (outside this repo) into arrays / features.
-2. I open a small GUI, look at each block, and assign one of those jamming classes.
+2. I launch a small GUI (`label_gui.py`), look at each block, and assign one of those jamming classes.
 3. The labels are saved so I can train and validate classifiers later.
+
+> **Entry point:** the script you actually run is **`label_gui.py`**.  
+> `feature_extractor.py` is just a helper module called from there; it is not meant to be used standalone.
 
 ---
 
@@ -19,32 +22,39 @@ The idea is simple:
 
 ```text
 .
-├── feature_extractor.py   # quick-and-dirty feature / data preparation script
-├── label_gui.py           # small GUI to step through blocks and assign labels
+├── label_gui.py           # main entry point – GUI to step through blocks and assign labels
+├── feature_extractor.py   # helper called by label_gui.py to prepare data / features
 └── .gitignore
 ```
 
-### `feature_extractor.py`
+### `label_gui.py` (main script)
 
-- Reads whatever preprocessed SBF data I have on disk.
-- Computes the views I want to see while labelling (for example, spectra or time series).
-- Writes them to a file that `label_gui.py` expects.
+- This is the script you execute, e.g.:
 
-Everything here is tailored to my folder structure and file naming, so expect to edit it for your own use.
+  ```bash
+  python label_gui.py
+  ```
 
-### `label_gui.py`
+- It:
+  - Loads / prepares the data by calling functions in `feature_extractor.py`.
+  - Shows one block at a time (time series, spectra, or whatever I configured).
+  - Lets me press a key / click a button to assign a label:
+    - `NoJam`
+    - `Chirp`
+    - `NB`
+    - `WB`
+  - Stores the labels (e.g. CSV / NumPy file), which I then use in my ML repos.
 
-- Loads the data / features prepared by `feature_extractor.py`.
-- Shows one block at a time.
-- Lets me press a key / click a button to assign a label:
-  - `NoJam`
-  - `Chirp`
-  - `NB`
-  - `WB`
-- Stores the labels (e.g. CSV / NumPy file), which I then use in my ML repos.
+### `feature_extractor.py` (helper)
+
+- Provides the functions that `label_gui.py` uses to:
+  - read my SBF-derived data from disk,
+  - compute the views I want while labelling (for example, spectra or time series),
+  - organise them in the format expected by the GUI.
+
+It is tightly coupled to my folder structure and filenames and is **not** intended to be run directly.
 
 ---
-
 
 ## Notes
 
