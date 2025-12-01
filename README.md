@@ -14,7 +14,7 @@ The idea is simple:
 3. The labels are saved so I can train and validate classifiers later.
 
 > **Entry point:** the script you actually run is **`label_gui.py`**.  
-> `feature_extractor.py` is just a helper module called from there; it is not meant to be used standalone.
+> `feature_extractor.py` is a helper module kept here to support (future) pre-labelling with a pretrained model.
 
 ---
 
@@ -23,7 +23,7 @@ The idea is simple:
 ```text
 .
 ├── label_gui.py           # main entry point – GUI to step through blocks and assign labels
-├── feature_extractor.py   # helper called by label_gui.py to prepare data / features
+├── feature_extractor.py   # helper for computing features for (future) pretrained-model pre-labelling
 └── .gitignore
 ```
 
@@ -36,7 +36,7 @@ The idea is simple:
   ```
 
 - It:
-  - Loads / prepares the data by calling functions in `feature_extractor.py`.
+  - Loads the SBF-derived data / blocks I want to label.
   - Shows one block at a time (time series, spectra, or whatever I configured).
   - Lets me press a key / click a button to assign a label:
     - `NoJam`
@@ -45,14 +45,24 @@ The idea is simple:
     - `WB`
   - Stores the labels (e.g. CSV / NumPy file), which I then use in my ML repos.
 
-### `feature_extractor.py` (helper)
+In the future, the GUI can also call into `feature_extractor.py` and a pretrained model to **pre-label** samples
+and present model suggestions that I can accept / correct.
 
-- Provides the functions that `label_gui.py` uses to:
-  - read my SBF-derived data from disk,
-  - compute the views I want while labelling (for example, spectra or time series),
-  - organise them in the format expected by the GUI.
+### `feature_extractor.py` (helper for pre-labelling)
 
-It is tightly coupled to my folder structure and filenames and is **not** intended to be run directly.
+- This file is not meant to be run directly.
+- It is kept here as a helper to:
+
+  - compute the same kind of features I use in my classifiers (for example, from the GNSS jamming classifier repo),
+  - feed those features into a **pretrained model** that could propose an initial label for each block.
+
+The idea is:
+
+1. `label_gui.py` calls feature-extraction functions from this module.
+2. A pretrained model (loaded in `label_gui.py`) uses those features to propose a label.
+3. The GUI shows both the raw data and the model’s proposed label, and I decide whether to keep or override it.
+
+Right now this is mostly infrastructure for that future “model-assisted labelling” workflow, so the details may change.
 
 ---
 
