@@ -13,6 +13,10 @@ NEW FEATURES (2025-12):
     * You can open an existing *_labels.csv and iterate over all
       saved NPZ samples to correct labels.
     * When a label is changed, the NPZ is renamed and CSV updated.
+- Per-label saving:
+    * When a label is changed, the corresponding NPZ is updated and
+      the CSV is rewritten immediately (atomic write via a temp file).
+    * If a label is corrected, only the latest NPZ is kept.
 
 MAIN MODES:
 - Mode 1: Label SBF file (new or resume).
@@ -351,7 +355,7 @@ def choose_model_file(initial: Optional[Path] = None) -> Optional[Path]:
     """
     Choose model file (.joblib/.pkl/.pt/.pth) via GUI, fallback to CLI.
     """
-    print("\n>>> Select MODEL file in the dialog (or cancel to type it).")
+    print("\n>>> Select MODEL file in the dialog (or cancel to type the path).")
     p = _tk_choose_file(
         title="Select pre-trained model (.joblib/.pkl/.pt/.pth)",
         filetypes=[
@@ -707,12 +711,16 @@ def save_labels_csv(csv_path: Path, labels_by_block: Dict[int, Dict[str, str]]):
     """
     Rewrite the labels CSV from the in-memory dict.
     Ensures one row per block_idx with the latest label.
+    Uses a temp file + atomic rename to avoid corrupting the CSV
+    if the process dies mid-write.
     """
     if not labels_by_block:
         print(f"No labels to save. Not writing {csv_path.name}.")
         return
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+    tmp_path = csv_path.with_suffix(csv_path.suffix + ".tmp")
+
+    with open(tmp_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDNAMES)
         writer.writeheader()
         for blk in sorted(labels_by_block.keys()):
@@ -730,6 +738,8 @@ def save_labels_csv(csv_path: Path, labels_by_block: Dict[int, Dict[str, str]]):
                     "fs_hz": row.get("fs_hz", ""),
                 }
             )
+
+    os.replace(tmp_path, csv_path)
     print(f"Saved {len(labels_by_block)} labels to {csv_path.name}")
 
 
@@ -741,14 +751,46 @@ def save_label_for_sample(
     meta: Dict,
     sbf_path: Path,
     out_dir: Path,
+    csv_path: Path,
     labels_by_block: Dict[int, Dict[str, str]],
 ):
     """
     Save/overwrite NPZ for a given sample and update labels_by_block.
+
+    If the block already had a label, the OLD NPZ file is deleted
+    (if its path is different from the new one) so only the latest
+    NPZ is kept on disk.
+
+    After updating labels_by_block, the CSV is flushed to disk.
     """
     base = sbf_path.stem
+
+    # If there was a previous label, remove its NPZ if the path changes
+    old_row = labels_by_block.get(block_idx)
+    if old_row is not None:
+        old_iq_path_str = old_row.get("iq_path", "")
+        if old_iq_path_str:
+            try:
+                old_iq_path = Path(old_iq_path_str)
+                if not old_iq_path.is_absolute():
+                    old_iq_path = (out_dir / old_iq_path).resolve()
+            except Exception:
+                old_iq_path = None
+        else:
+            old_iq_path = None
+    else:
+        old_iq_path = None
+
     sample_id = f"{base}_blk{block_idx:06d}_{label}"
     iq_path = (out_dir / f"{sample_id}.npz").resolve()
+
+    # Only delete old NPZ if it's a different file than the new one
+    if old_iq_path is not None and old_iq_path != iq_path and old_iq_path.exists():
+        try:
+            old_iq_path.unlink()
+            print(f"  [CLEANUP] Removed old NPZ for block {block_idx}: {old_iq_path.name}")
+        except Exception as e:
+            print(f"  [WARN] Could not remove old NPZ {old_iq_path}: {e}")
 
     np.savez_compressed(
         iq_path,
@@ -772,6 +814,9 @@ def save_label_for_sample(
         "utc_iso": str(meta["utc_iso"]),
         "fs_hz": str(fs),
     }
+
+    # Persist immediately for crash safety
+    save_labels_csv(csv_path, labels_by_block)
 
 
 # ============================ PRE-LABEL MODEL ============================
@@ -1104,9 +1149,9 @@ def run_labelling_mode():
                 print("Unknown choice, waiting again...")
                 continue
 
-            # Save/update label for this sample
+            # Save/update label for this sample (NPZ + CSV, removing old NPZ if needed)
             save_label_for_sample(
-                block_idx, label, iq, fs, meta, sbf_path, out_dir, labels_by_block
+                block_idx, label, iq, fs, meta, sbf_path, out_dir, csv_path, labels_by_block
             )
             print(
                 f"Labeled sample {idx+1}/{num_candidates} "
@@ -1216,7 +1261,6 @@ def run_review_mode():
 
             if choice == "__quit__":
                 print("Quitting review session. Saving labels...")
-                # labels_by_block already updated via rows list
                 save_labels_csv(csv_path, labels_by_block)
                 plt.close("all")
                 print(f"\nReview finished. Labels saved in: {csv_path}")
@@ -1282,6 +1326,9 @@ def run_review_mode():
                 row["iq_path"] = str(new_iq_path)
                 labels_by_block[block_idx] = row
                 current_label = new_label
+
+                # Persist after each edit for crash safety
+                save_labels_csv(csv_path, labels_by_block)
 
                 idx += 1
                 break
