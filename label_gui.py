@@ -17,6 +17,15 @@ NEW FEATURES (2025-12):
     * When a label is changed, the corresponding NPZ is updated and
       the CSV is rewritten immediately (atomic write via a temp file).
     * If a label is corrected, only the latest NPZ is kept.
+- Goto:
+    * Key 'g' or button "g: Goto" lets you jump directly to any sample
+      index (1..N) in the current session.
+- Self-healing in review mode:
+    * At startup, mismatches between CSV labels and NPZ filename suffixes
+      are detected and automatically fixed by renaming the NPZ files
+      to match the CSV label.
+    * Renaming when changing labels is now "all-or-nothing": if the
+      NPZ rename fails, the CSV is not updated, so they stay consistent.
 
 MAIN MODES:
 - Mode 1: Label SBF file (new or resume).
@@ -40,7 +49,7 @@ LABELLING MODE (from SBF):
     * Upper panel: spectrogram (STFT) – visually matched to validation.py.
     * Lower panel: I/Q waveforms.
     * Shows model prediction + probability and CURRENT saved label.
-    * Buttons: NoJam, Chirp, NB, WB, Interference, Accept, Back, Skip, Quit.
+    * Buttons: NoJam, Chirp, NB, WB, Interference, Accept, Back, Skip, Goto, Quit.
     * Keyboard:
         - 1: NoJam
         - 2: Chirp
@@ -50,6 +59,7 @@ LABELLING MODE (from SBF):
         - a / Enter / Space: Accept model prediction
         - b: Back (previous sample)
         - s: Skip (no change / no label)
+        - g: Goto sample index (1..N)
         - q: Quit (session saved)
 """
 
@@ -421,6 +431,7 @@ class LabelFigure:
         self.btn_accept: Optional[Button] = None
         self.btn_back: Optional[Button] = None
         self.btn_skip: Optional[Button] = None
+        self.btn_goto: Optional[Button] = None
         self.btn_quit: Optional[Button] = None
         self.cbar_spec = None
 
@@ -434,8 +445,8 @@ class LabelFigure:
 
     def _build_buttons(self):
         n_cls = len(self.class_labels)
-        # control buttons: Accept, Back, Skip, Quit
-        control_buttons = 4
+        # control buttons: Accept, Back, Skip, Goto, Quit
+        control_buttons = 5
         total_buttons = n_cls + control_buttons
         pad = 0.015
         width = (0.92 - pad * (total_buttons + 1)) / total_buttons
@@ -469,9 +480,16 @@ class LabelFigure:
         self.btn_skip = Button(ax_skip, "s: Skip")
         self.btn_skip.on_clicked(self._make_button_handler("__skip__"))
 
+        # Goto
+        ax_goto = self.fig.add_axes(
+            [left + (n_cls + 3) * (width + pad), y0, width, h]
+        )
+        self.btn_goto = Button(ax_goto, "g: Goto")
+        self.btn_goto.on_clicked(self._make_button_handler("__goto__"))
+
         # Quit
         ax_quit = self.fig.add_axes(
-            [left + (n_cls + 3) * (width + pad), y0, width, h]
+            [left + (n_cls + 4) * (width + pad), y0, width, h]
         )
         self.btn_quit = Button(ax_quit, "q: Quit")
         self.btn_quit.on_clicked(self._make_button_handler("__quit__"))
@@ -496,6 +514,8 @@ class LabelFigure:
             self.choice = "__back__"
         elif key == "s":
             self.choice = "__skip__"
+        elif key == "g":
+            self.choice = "__goto__"
         elif key == "q":
             self.choice = "__quit__"
 
@@ -508,6 +528,8 @@ class LabelFigure:
             self.btn_back.ax.set_facecolor("0.85")
         if self.btn_skip is not None:
             self.btn_skip.ax.set_facecolor("0.85")
+        if self.btn_goto is not None:
+            self.btn_goto.ax.set_facecolor("0.85")
         if self.btn_quit is not None:
             self.btn_quit.ax.set_facecolor("0.85")
 
@@ -819,6 +841,86 @@ def save_label_for_sample(
     save_labels_csv(csv_path, labels_by_block)
 
 
+def fix_inconsistent_npz_filenames(
+    rows: List[Dict[str, str]],
+    labels_by_block: Dict[int, Dict[str, str]],
+    out_dir: Path,
+    csv_path: Path,
+):
+    """
+    Self-healing step for review mode.
+
+    For each row:
+    - Look at row["label"] (CSV ground truth).
+    - Look at the NPZ filename suffix (e.g. *_Chirp.npz).
+    - If they differ, rename the NPZ to use the CSV label and
+      update sample_id + iq_path in the CSV dict.
+    """
+    num_fixed = 0
+
+    for row in rows:
+        label = row.get("label", "")
+        if not label:
+            continue
+
+        iq_path_raw = row.get("iq_path", "")
+        if not iq_path_raw:
+            continue
+
+        iq_path = Path(iq_path_raw)
+        if not iq_path.is_absolute():
+            iq_path = (out_dir / iq_path).resolve()
+
+        if not iq_path.exists():
+            continue
+
+        stem = iq_path.stem  # e.g. alt01002_blk004607_Chirp
+        parts = stem.rsplit("_", 1)
+        if len(parts) < 2:
+            # cannot extract label from name
+            continue
+
+        label_in_name = parts[1]
+        if label_in_name == label:
+            # already consistent
+            continue
+
+        try:
+            block_idx = int(row["block_idx"])
+        except (KeyError, TypeError, ValueError):
+            # cannot reliably reconstruct name, skip
+            continue
+
+        # Rebuild canonical name using CSV label as truth
+        if "_blk" in stem:
+            prefix = stem.split("_blk")[0]
+        else:
+            prefix = stem
+
+        new_sample_id = f"{prefix}_blk{block_idx:06d}_{label}"
+        new_iq_path = iq_path.with_name(f"{new_sample_id}.npz")
+
+        if new_iq_path == iq_path:
+            continue  # nothing to do
+
+        try:
+            iq_path.rename(new_iq_path)
+            row["sample_id"] = new_sample_id
+            row["iq_path"] = str(new_iq_path)
+            labels_by_block[block_idx] = row
+            num_fixed += 1
+            print(
+                f"[FIX] Auto-renamed NPZ to match CSV label: "
+                f"{iq_path.name} -> {new_iq_path.name}"
+            )
+        except Exception as e:
+            print(f"[WARN] Failed to auto-fix NPZ name {iq_path}: {e}")
+
+    if num_fixed:
+        save_labels_csv(csv_path, labels_by_block)
+        print(f"[INFO] Auto-fixed {num_fixed} NPZ filename(s) to match CSV labels.")
+
+
 # ============================ PRE-LABEL MODEL ============================
 
 
@@ -1073,6 +1175,7 @@ def run_labelling_mode():
     print("  a / Enter / Space: Accept model prediction")
     print("  b: Back to previous sample")
     print("  s: Skip sample (leave unlabeled / unchanged)")
+    print("  g: Goto sample index (1–N)")
     print("  q: Quit session (labels will be saved)\n")
 
     idx = start_idx
@@ -1125,6 +1228,36 @@ def run_labelling_mode():
                     f"(block {prev_blk})."
                 )
                 # break inner loop to redraw previous sample
+                break
+
+            if choice == "__goto__":
+                new_idx: Optional[int] = None
+                while True:
+                    txt = input(
+                        f"Enter sample index [1-{num_candidates}] to jump to (blank = cancel): "
+                    ).strip()
+                    if txt == "":
+                        print("Goto cancelled.")
+                        break
+                    try:
+                        t = int(txt)
+                    except ValueError:
+                        print("Not a valid integer. Try again.")
+                        continue
+                    if not (1 <= t <= num_candidates):
+                        print(f"Index must be between 1 and {num_candidates}.")
+                        continue
+                    new_idx = t - 1
+                    break
+
+                if new_idx is not None:
+                    idx = new_idx
+                    block_idx = candidates[idx][0]
+                    print(
+                        f"Jumping to sample {idx+1}/{num_candidates} "
+                        f"(block {block_idx})."
+                    )
+                # break to redraw (even if cancelled we stay on same idx)
                 break
 
             if choice == "__skip__":
@@ -1190,6 +1323,9 @@ def run_review_mode():
     num_samples = len(rows)
     print(f"\nReviewing {num_samples} labelled samples from {csv_path.name}.")
 
+    # Auto-fix cases where CSV label and NPZ filename suffix diverged
+    fix_inconsistent_npz_filenames(rows, labels_by_block, out_dir, csv_path)
+
     fig_tool = LabelFigure(CLASS_LABELS)
 
     print("\nReview mode.")
@@ -1199,6 +1335,7 @@ def run_review_mode():
     print("  a / Enter / Space: Keep current label")
     print("  b: Back to previous sample")
     print("  s: Skip sample (keep current label, move on)")
+    print("  g: Goto sample index (1–N)")
     print("  q: Quit review (labels will be saved)\n")
 
     idx = 0
@@ -1227,13 +1364,13 @@ def run_review_mode():
                 idx += 1
                 continue
 
-        data = np.load(iq_path)
-        iq = data["iq"]
-        fs = float(data["fs_hz"])
-
-        gps_week = int(data["gps_week"])
-        tow_s = float(data["tow_s"])
-        utc_iso = str(data["utc_iso"])
+        # Load NPZ with context manager so Windows doesn't keep the file locked
+        with np.load(iq_path) as data:
+            iq = data["iq"]
+            fs = float(data["fs_hz"])
+            gps_week = int(data["gps_week"])
+            tow_s = float(data["tow_s"])
+            utc_iso = str(data["utc_iso"])
 
         meta = dict(
             gps_week=gps_week,
@@ -1274,6 +1411,32 @@ def run_review_mode():
                 print(f"Going back to sample {idx+1}/{num_samples}.")
                 break
 
+            if choice == "__goto__":
+                new_idx: Optional[int] = None
+                while True:
+                    txt = input(
+                        f"Enter sample index [1-{num_samples}] to jump to (blank = cancel): "
+                    ).strip()
+                    if txt == "":
+                        print("Goto cancelled.")
+                        break
+                    try:
+                        t = int(txt)
+                    except ValueError:
+                        print("Not a valid integer. Try again.")
+                        continue
+                    if not (1 <= t <= num_samples):
+                        print(f"Index must be between 1 and {num_samples}.")
+                        continue
+                    new_idx = t - 1
+                    break
+
+                if new_idx is not None:
+                    idx = new_idx
+                    print(f"Jumping to sample {idx+1}/{num_samples}.")
+                # break to redraw (even if cancelled)
+                break
+
             if choice == "__skip__":
                 print(
                     f"Sample {idx+1}/{num_samples} (block {block_idx}) "
@@ -1308,27 +1471,48 @@ def run_review_mode():
                     prefix = stem.split("_blk")[0]
                 else:
                     prefix = stem
+
                 new_sample_id = f"{prefix}_blk{block_idx:06d}_{new_label}"
                 new_iq_path = iq_path.with_name(f"{new_sample_id}.npz")
 
+                # If the target name is the same as current, just update CSV
+                if new_iq_path == iq_path:
+                    row["label"] = new_label
+                    row["sample_id"] = new_sample_id
+                    row["iq_path"] = str(new_iq_path)
+                    labels_by_block[block_idx] = row
+                    current_label = new_label
+                    save_labels_csv(csv_path, labels_by_block)
+                    print(
+                        f"Sample {idx+1}/{num_samples} (block {block_idx}) "
+                        f"updated label in CSV (filename already matched)."
+                    )
+                    idx += 1
+                    break
+
+                renamed_ok = False
                 try:
                     iq_path.rename(new_iq_path)
+                    renamed_ok = True
                     print(
                         f"Renamed NPZ: {iq_path.name} -> {new_iq_path.name} "
                         f"and updated label {current_label} -> {new_label}."
                     )
                 except Exception as e:
                     print(f"[WARN] Failed to rename NPZ: {e}")
-                    new_iq_path = iq_path  # fallback: keep old path
+                    # Do NOT change CSV if rename failed
+                    print(
+                        "Keeping previous CSV label and filename because rename failed."
+                    )
 
-                row["label"] = new_label
-                row["sample_id"] = new_sample_id
-                row["iq_path"] = str(new_iq_path)
-                labels_by_block[block_idx] = row
-                current_label = new_label
-
-                # Persist after each edit for crash safety
-                save_labels_csv(csv_path, labels_by_block)
+                if renamed_ok:
+                    row["label"] = new_label
+                    row["sample_id"] = new_sample_id
+                    row["iq_path"] = str(new_iq_path)
+                    labels_by_block[block_idx] = row
+                    current_label = new_label
+                    # Persist after each successful edit
+                    save_labels_csv(csv_path, labels_by_block)
 
                 idx += 1
                 break
